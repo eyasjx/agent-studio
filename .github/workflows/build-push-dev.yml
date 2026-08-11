@@ -174,12 +174,26 @@ jobs:
         id: image_config
         env:
           GHCR_IMAGE_REPOSITORY_OVERRIDE: ${{ vars.GHCR_IMAGE_REPOSITORY }}
+          DOCKERHUB_IMAGE_REPOSITORY_OVERRIDE: ${{ vars.DOCKERHUB_IMAGE_REPOSITORY }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
+      
           REPOSITORY_LOWER=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           GHCR_IMAGE_REPOSITORY="${GHCR_IMAGE_REPOSITORY_OVERRIDE:-ghcr.io/${REPOSITORY_LOWER}}"
+          DOCKERHUB_IMAGE_REPOSITORY="${DOCKERHUB_IMAGE_REPOSITORY_OVERRIDE:-${GHCR_IMAGE_REPOSITORY#ghcr.io/}}"
+      
+          DOCKERHUB_ENABLED=false
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ] \
+            && curl -fsS "https://hub.docker.com/v2/repositories/${DOCKERHUB_IMAGE_REPOSITORY}/" >/dev/null; then
+            DOCKERHUB_ENABLED=true
+          fi
+      
           echo "ghcr_registry=${GHCR_IMAGE_REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
           echo "ghcr_repository=${GHCR_IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_repository=${DOCKERHUB_IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_enabled=${DOCKERHUB_ENABLED}" >> "$GITHUB_OUTPUT"
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -188,29 +202,68 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Login to Docker Hub
+        if: steps.image_config.outputs.dockerhub_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+    
       - name: Build and push ${{ matrix.service }} for ${{ matrix.arch }}
         env:
           REPOSITORY: ${{ steps.image_config.outputs.ghcr_repository }}
+          DOCKERHUB_REPOSITORY: ${{ steps.image_config.outputs.dockerhub_repository }}
+          DOCKERHUB_ENABLED: ${{ steps.image_config.outputs.dockerhub_enabled }}
           SERVICE: ${{ matrix.service }}
           ARCH: ${{ matrix.arch }}
           BUILD_TS: ${{ needs.prepare.outputs.build_ts }}
         run: |
           set -euo pipefail
+      
           case "${SERVICE}" in
-            studio-manager) BASE_IMAGE=eclipse-temurin:17-jre; DOCKERFILE=Dockerfile ;;
-            studio-console) BASE_IMAGE=nginx:1.27; DOCKERFILE=Dockerfile ;;
-            studio-runtime) BASE_IMAGE=python:3.11-slim; DOCKERFILE=Dockerfile.dev ;;
-            studio-builder) BASE_IMAGE=python:3.11-slim; DOCKERFILE=Dockerfile ;;
+            studio-manager)
+              BASE_IMAGE=eclipse-temurin:17-jre
+              DOCKERFILE=Dockerfile
+              ;;
+            studio-console)
+              BASE_IMAGE=nginx:1.27
+              DOCKERFILE=Dockerfile
+              ;;
+            studio-runtime)
+              BASE_IMAGE=python:3.11-slim
+              DOCKERFILE=Dockerfile.dev
+              ;;
+            studio-builder)
+              BASE_IMAGE=python:3.11-slim
+              DOCKERFILE=Dockerfile
+              ;;
           esac
-          if [ "${ARCH}" = amd64 ]; then SUFFIX=x86_64; else SUFFIX=arm64; fi
+      
+          if [ "${ARCH}" = "amd64" ]; then
+            SUFFIX=x86_64
+          else
+            SUFFIX=arm64
+          fi
+      
           TAG="dev-${BUILD_TS}.${SUFFIX}"
+      
+          IMAGE_TAGS=(
+            --tag "${REPOSITORY}/${SERVICE}:${TAG}"
+          )
+      
+          if [ "${DOCKERHUB_ENABLED}" = "true" ]; then
+            IMAGE_TAGS+=(
+              --tag "${DOCKERHUB_REPOSITORY}:${SERVICE}-${TAG}"
+            )
+          fi
+      
           docker buildx build \
             --file "docker/${SERVICE}/${DOCKERFILE}" \
             --platform "linux/${ARCH}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
             --cache-from "type=gha,scope=${SERVICE}-dev-${ARCH}" \
             --cache-to "type=gha,scope=${SERVICE}-dev-${ARCH},mode=min" \
-            --tag "${REPOSITORY}/${SERVICE}:${TAG}" \
+            "${IMAGE_TAGS[@]}" \
             --progress plain \
             --push \
             "docker/${SERVICE}"
